@@ -17,6 +17,10 @@ from ..core.http import split_host_port
 from ..core.models import Finding, Host
 from ..core.module import Module, register
 
+#: Wall-clock budget for a single label lookup. Most candidates do not exist,
+#: so this bounds the slow NXDOMAIN path without cutting off a live answer.
+RESOLVE_BUDGET = 2.0
+
 #: Common prefixes that resolve on real estates far more often than random ones.
 WORDS: tuple[str, ...] = (
     "www", "api", "dev", "staging", "test", "admin", "mail", "vpn", "git",
@@ -116,11 +120,20 @@ class SubdomainModule(Module):
         return True
 
     async def _resolve(self, name: str, semaphore: asyncio.Semaphore) -> list[str]:
-        """Return the A/AAAA addresses of ``name``, or an empty list."""
+        """Return the A/AAAA addresses of ``name``, or an empty list.
+
+        Each candidate is one blocking resolver call. Almost all of them are
+        NXDOMAIN, and a slow resolver answers those at the pace of its own
+        timeout, so every lookup runs under a wall-clock budget. Without it a
+        180-label list against a domain with a lazy resolver took 12 seconds.
+        """
         async with semaphore:
             try:
-                infos = await asyncio.to_thread(socket.getaddrinfo, name, None)
-            except (socket.gaierror, UnicodeError, OSError):
+                infos = await asyncio.wait_for(
+                    asyncio.to_thread(socket.getaddrinfo, name, None),
+                    timeout=RESOLVE_BUDGET,
+                )
+            except (TimeoutError, socket.gaierror, UnicodeError, OSError):
                 return []
         addresses = {str(info[4][0]) for info in infos}
         return sorted(addresses)

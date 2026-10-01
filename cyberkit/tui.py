@@ -42,6 +42,7 @@ MODE_KEY_SETTINGS = "5"
 MODE_KEY_LANGUAGE = "6"
 MODE_KEY_MODE = "7"
 MODE_KEY_MUSIC = "8"
+MODE_KEY_TRACK = "9"
 MODE_KEY_EXIT = "0"
 
 
@@ -65,11 +66,13 @@ class App:
         self.advanced = value
         ui.set_theme(ui.ADVANCED_THEME if value else ui.BASIC_THEME)
         i18n.set_advanced(value)
+        # Ambient audio only. The matrix rain used to run here, but it drew
+        # without moving the cursor, so frames stacked up and mangled the menu.
+        # It is off by default and can be re-enabled from the menu when a full
+        # screen is not in use.
         if value:
-            self.matrix.start()
             audio.Music.enable()
         else:
-            self.matrix.stop()
             audio.Music.disable()
         self.cine.mode_transition(value)
 
@@ -106,7 +109,8 @@ class App:
             rows.append((MODE_KEY_SETTINGS, i18n.t("menu.settings"), ""))
         rows.append((MODE_KEY_LANGUAGE, i18n.t("menu.language"), ""))
         rows.append((MODE_KEY_MODE, i18n.t("menu.mode"), ""))
-        rows.append((MODE_KEY_MUSIC, i18n.t("menu.music"), ""))
+        rows.append((MODE_KEY_MUSIC, i18n.t("menu.music"), audio.Music.track()))
+        rows.append((MODE_KEY_TRACK, i18n.t("menu.track"), ""))
         rows.append((MODE_KEY_EXIT, i18n.t("menu.exit"), ""))
         return rows
 
@@ -199,10 +203,23 @@ class App:
             print(ui.paint(f" {i18n.t('music.unavailable')}: {reason}", ui.YELLOW))
             return
         if audio.Music.enable():
-            player_backend = audio.Music.backend_name()
-            print(ui.paint(f" {i18n.t('music.on')} ({player_backend})", ui.GREEN))
+            backend = audio.Music.backend_name()
+            print(ui.paint(f" {i18n.t('music.on')} ({audio.Music.track()}, {backend})", ui.GREEN))
+            print(ui.paint(f"   {i18n.t('music.next')} (menu {MODE_KEY_MUSIC})", ui.DIM))
         else:
             print(ui.paint(f" {i18n.t('music.unavailable')}", ui.YELLOW))
+
+    def next_track(self) -> None:
+        """Cycle to the next music style and play it if music is on."""
+        current = audio.Music.track()
+        index = (audio.TRACKS.index(current) + 1) % len(audio.TRACKS) if current in audio.TRACKS else 0
+        target = audio.TRACKS[index]
+        was_on = audio.Music.is_enabled()
+        audio.Music.set_track(target)
+        if was_on:
+            print(ui.paint(f" {i18n.t('music.track', track=target)}", ui.GREEN))
+        else:
+            print(ui.paint(f" {i18n.t('music.selected', track=target)}", ui.DIM))
 
     def show_modules(self) -> None:
         self.header(i18n.t("menu.modules"))
@@ -390,6 +407,8 @@ def main(argv: list[str] | None = None) -> int:
                 app.toggle_mode()
             elif choice == MODE_KEY_MUSIC:
                 app.toggle_music()
+            elif choice == MODE_KEY_TRACK:
+                app.next_track()
             else:
                 print(ui.paint(f" {i18n.t('misc.unknown_option')}", ui.YELLOW))
                 _pause()

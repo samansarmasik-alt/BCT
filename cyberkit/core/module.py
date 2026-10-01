@@ -110,11 +110,17 @@ async def run_modules(
     *,
     targets: list[str] | None = None,
 ) -> Result:
-    """Run ``modules`` sequentially, containing failures and scope errors.
+    """Run ``modules`` concurrently, containing failures and scope errors.
 
-    Modules are sequential on purpose: they share the rate limiter and one
-    HTTP client, and later stages consume earlier results. Per-module fan-out
-    is parallelized inside each module.
+    Modules are independent: each one talks to the network and returns hosts,
+    and none consumes another's output. Running them one after another made the
+    run take the *sum* of every module's slowest probe, which is why a full pass
+    used to sit near 30 seconds while the individual work was a few seconds
+    each. Concurrently the run costs about the slowest module instead.
+
+    The shared HTTP client and rate limiter are per-module instances, so nothing
+    needs to be serialized. Ordering in the report comes from the module list,
+    not from execution order.
     """
     load_builtin_modules()
 
@@ -128,22 +134,25 @@ async def run_modules(
         result.finished_at = now()
         return result
 
-    for cls in modules:
-        instance = cls(config)
-        if instance.needs_target and not allowed:
-            continue
+    async def run_one(cls: type[Module]) -> tuple[str, list[Host], float, str]:
         started = time.perf_counter()
         try:
+            instance = cls(config)
             hosts = await instance.run(allowed)
         except ScopeViolation as exc:
-            result.errors.append(f"{cls.name}: {exc}")
+            return cls.name, [], time.perf_counter() - started, str(exc)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            result.errors.append(f"{cls.name}: {exc.__class__.__name__}: {exc}")
-        else:
-            result.hosts.extend(hosts)
-            result.meta.setdefault("timings", {})[cls.name] = round(time.perf_counter() - started, 3)
+            return cls.name, [], time.perf_counter() - started, f"{exc.__class__.__name__}: {exc}"
+        return cls.name, hosts, time.perf_counter() - started, ""
+
+    outcomes = await asyncio.gather(*(run_one(cls) for cls in modules))
+    for name, hosts, elapsed, error in outcomes:
+        result.meta.setdefault("timings", {})[name] = round(elapsed, 3)
+        if error:
+            result.errors.append(f"{name}: {error}")
+        result.hosts.extend(hosts)
 
     result.finished_at = now()
     return result

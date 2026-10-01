@@ -42,7 +42,7 @@ MAX_RENDER_SECONDS = 60.0
 MIN_SAMPLE_RATE = 8000
 MAX_SAMPLE_RATE = 48000
 CHORD_SECONDS = 8.0
-DEFAULT_LOOP_SECONDS = 32.0
+DEFAULT_LOOP_SECONDS = 40.0
 CACHE_NAME = "cyberkit_ambient.wav"
 
 #: Playback volume as a 0.0-1.0 fraction. Deliberately low: this is background
@@ -51,7 +51,16 @@ DEFAULT_VOLUME = 0.18
 
 #: Headroom applied to the rendered mix. Combined with DEFAULT_VOLUTE this keeps
 #: the loop well below clipping even when a player ignores its volume flag.
-MASTER_GAIN = 0.34
+#: Headroom for the rendered mix. Measured on the chiptune render this lands the
+#: loop at roughly 20% peak and 9% RMS, which is audible as background music and
+#: far from fatiguing. The player is additionally asked for 18% volume.
+MASTER_GAIN = 0.8
+
+#: The chiptune lead sits well below the pad. Without its own lift the melody
+#: disappears into the background and the track sounds like aimless drift, which
+#: is exactly what the previous ambient-only loop sounded like.
+LEAD_GAIN = 0.42
+PAD_GAIN = 0.30
 
 _WAV = ".wav"
 
@@ -169,6 +178,92 @@ def _note_hz(root_hz: float, semitones: int) -> float:
     return root_hz * (2.0 ** (semitones / 12.0))
 
 
+# --- Track 1: chiptune -------------------------------------------------------
+#
+# The signature sound of the genre this is imitating is a short, bright melody
+# moving note by note over a soft sustained pad, with a square/pulse lead. The
+# earlier ambient loop was pads and sub-bass only, which is why it read as
+# "background noise" rather than music.
+
+#: A minor pentatonic, the scale such melodies are usually built from.
+_PENTATONIC = (0, 3, 5, 7, 10, 12, 15, 17, 19, 22, 24)
+
+#: (step index, semitone, note length in beats) - a lazy, wandering line. The
+#: step index is what the renderer uses to place the note inside its bar.
+_CHIPTUNE_MELODY: tuple[tuple[int, int, float], ...] = (
+    (0, 12, 1.0), (1, 15, 0.5), (2, 19, 0.5), (3, 17, 1.0), (4, 15, 1.0),
+    (5, 12, 0.5), (6, 10, 0.5), (7, 12, 2.0), (8, 17, 0.5), (9, 19, 0.5),
+    (10, 22, 1.0), (11, 19, 1.0), (12, 17, 0.5), (13, 15, 0.5), (14, 12, 2.0),
+    (15, 10, 0.5), (16, 12, 0.5), (17, 15, 1.0), (18, 12, 1.0), (19, 7, 2.0),
+    (20, 10, 0.5), (21, 12, 0.5), (22, 15, 1.0), (23, 19, 1.0), (24, 17, 3.0),
+)
+
+#: One bar is 8 melody steps; chords change every two bars.
+_CHIPTUNE_BEAT = 0.24
+
+
+def _pulse(
+    freq: float, seconds: float, sample_rate: int, duty: float = 0.25
+) -> array.array:
+    """Pulse wave with the given duty cycle.
+
+    A 12.5%-25% duty square is the classic bright chip lead; the harmonics are
+    what make it read as a melody rather than a test tone.
+    """
+    count = int(seconds * sample_rate)
+    if count <= 0:
+        return array.array("d")
+    period = sample_rate / max(1.0, freq)
+    out = array.array("d", bytes(8 * count))
+    for n in range(count):
+        out[n] = 1.0 if (n % period) / period < duty else -1.0
+    return out
+
+
+def _render_chiptune_bar(
+    bar: int, sample_rate: int, root: int
+) -> array.array:
+    """One bar of lead melody plus a soft pad underneath."""
+    bar_seconds = 8 * _CHIPTUNE_BEAT * 2
+    block = array.array("d", bytes(8 * int(bar_seconds * sample_rate)))
+
+    # Pad: a slow major-ish triad, the "warm bed" under the melody.
+    pad_seconds = bar_seconds + 1.5
+    pad = array.array("d", bytes(8 * int(pad_seconds * sample_rate)))
+    pad_env = _adsr(len(pad), 0.6, 1.2, sample_rate, sustain=0.75)
+    for voice, semitone in enumerate((0, 4, 7, 11)):
+        tone = _sine(_note_hz(_ROOT_HZ * 2, root + semitone), pad_seconds, sample_rate,
+                     phase=voice * 7.0)
+        gain = 0.085 / (1.0 + voice * 0.3)
+        for n in range(len(pad)):
+            pad[n] += tone[n] * gain
+    _lowpass(pad, 2600.0, sample_rate)
+    for n in range(len(pad)):
+            pad[n] *= pad_env[n]
+    _mix_into(block, pad, PAD_GAIN, 0)
+
+    # Lead: the melody, one note at a time, with a short percussive decay.
+    step = 0
+    for _index, semitone, beats in _CHIPTUNE_MELODY:
+        if step // 8 != bar % 4:
+            step += 1
+            continue
+        start = (step % 8) * _CHIPTUNE_BEAT * 2
+        length = beats * _CHIPTUNE_BEAT
+        if start >= bar_seconds:
+            step += 1
+            continue
+        note = _pulse(_note_hz(_ROOT_HZ, root + semitone), length, sample_rate)
+        env = _adsr(len(note), 0.006, 0.055, sample_rate, sustain=0.35)
+        for n in range(len(note)):
+            note[n] *= env[n]
+        _lowpass(note, 4200.0, sample_rate)
+        _mix_into(block, note, LEAD_GAIN, int(start * sample_rate))
+        step += 1
+
+    return _soft_limit(block)
+
+
 def _render_chord(index: int, sample_rate: int, rng: Random) -> array.array:
     """One chord: breathy pad + sub-bass root + sparse blips + rare shimmer."""
     root, intervals = _PROGRESSION[index % len(_PROGRESSION)]
@@ -245,6 +340,48 @@ def _to_pcm16(buf: array.array, gain: float = 1.0) -> bytes:
     return pcm.tobytes()
 
 
+def render_chiptune(
+    path: str,
+    seconds: float = 40.0,
+    sample_rate: int = 22050,
+) -> str:
+    """Render the chiptune loop: a wandering lead melody over a soft pad.
+
+    Chosen over the ambient pad because a moving line is what makes the player
+    aware of the music instead of reading it as background hiss. The melody is
+    fixed rather than random so the loop is recognizable on repeat.
+    """
+    rate = _clamp_rate(sample_rate)
+    length = max(4.0, min(float(seconds), MAX_RENDER_SECONDS))
+    bar_seconds = 8 * _CHIPTUNE_BEAT * 2
+    bars = max(1, math.ceil(length / bar_seconds))
+
+    mix = array.array("d", bytes(8 * int(length * rate)))
+    for bar in range(bars):
+        root, _ = _PROGRESSION[(bar // 2) % len(_PROGRESSION)]
+        block = _render_chiptune_bar(bar, rate, root)
+        _mix_into(mix, block, 0.85 if bar else 1.0, int(bar * bar_seconds * rate))
+        if int((bar + 1) * bar_seconds * rate) >= len(mix):
+            break
+
+    # Fold the overflow back over the head so the loop point is seamless.
+    total = bars * int(bar_seconds * rate)
+    if total > len(mix):
+        overlap = total - len(mix)
+        for n in range(overlap):
+            mix[n] = mix[n] * 0.5 + mix[len(mix) - overlap + n] * 0.5
+    _soft_limit(mix)
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(target), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(_to_pcm16(mix, MASTER_GAIN))
+    return str(target)
+
+
 def render_clip(
     path: str,
     seconds: float = 32.0,
@@ -293,35 +430,173 @@ def generate_loop(
     directory: str | None = None,
     seconds: float = DEFAULT_LOOP_SECONDS,
     cache_name: str = CACHE_NAME,
+    track: str = "chiptune",
 ) -> str | None:
-    """Render (once) and cache the ambient loop; returns the WAV path or None."""
+    """Render (once) and cache the loop; returns the WAV path or None.
+
+    ``track`` picks the style. The cache file name includes the style so
+    switching never reuses a stale render of the wrong music.
+    """
     base = Path(directory) if directory else Path(tempfile.gettempdir())
-    target = base / cache_name
+    name = cache_name.replace(".wav", f"_{track}.wav")
+    target = base / name
     try:
         if target.is_file() and target.stat().st_size > 44:
             return str(target)
     except OSError:
         pass
     try:
-        return render_clip(str(target), seconds=seconds)
+        if track == "ambient":
+            return render_clip(str(target), seconds=seconds)
+        return render_chiptune(str(target), seconds=seconds)
     except Exception as exc:  # render must never break the caller
-        _debug(f"ambient render failed: {exc}")
+        _debug(f"render failed: {exc}")
         return None
+
+
+#: Selectable styles offered in the music menu.
+TRACKS: tuple[str, ...] = ("chiptune", "ambient")
 
 
 # --- Backends ---------------------------------------------------------------
 
 
-def _spawn(argv: list[str]) -> subprocess.Popen[bytes] | None:
-    """Launch a fully detached player process, or None on any failure.
+def _make_kill_on_close_job() -> int | None:
+    """Windows Job Object that kills its members when this process exits.
 
-    The detachment flags are the whole point of this helper: without them the
-    child is tied to our console, so minimizing the terminal or Alt-Tabbing away
-    suspends or kills playback on Windows, and a Ctrl+C in the foreground
-    process group takes the player down with it. On Windows we use
-    DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW; on POSIX,
-    start_new_session=True plus devnull handles. Either way the player becomes
-    independent of our terminal's focus state and inherits no console.
+    Returns the job handle, or None if the API is unavailable. The handle is
+    kept open for the lifetime of the process on purpose: closing it early
+    would kill the player immediately.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                (name, ctypes.c_ulonglong)
+                for name in (
+                    "ReadOperationCount",
+                    "WriteOperationCount",
+                    "OtherOperationCount",
+                    "ReadTransferCount",
+                    "WriteTransferCount",
+                    "OtherTransferCount",
+                )
+            ]
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        # Declare the signatures: without them ctypes assumes a 32-bit return
+        # and a default int argument type, which makes SetInformationJobObject
+        # fail with ERROR_BAD_LENGTH because the struct pointer is truncated.
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            _debug(f"CreateJobObjectW failed: {ctypes.GetLastError()}")
+            return None
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        ok = kernel32.SetInformationJobObject(
+            job,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+        if not ok:
+            _debug(f"SetInformationJobObject failed: {ctypes.GetLastError()}")
+            kernel32.CloseHandle(job)
+            return None
+        _JOB_HANDLE.append(job)
+        _debug("kill-on-close job object ready")
+        return job
+    except Exception as exc:
+        _debug(f"job object unavailable: {exc}")
+        return None
+
+
+#: Keeps job handles alive for the process lifetime; see _make_kill_on_close_job.
+#: The handles must never be closed early or the player dies with them.
+_JOB_HANDLE: list[int] = []
+
+
+def _assign_to_job(pid: int, job: int) -> bool:
+    """Attach a freshly spawned process to our kill-on-close job."""
+    if os.name != "nt" or not job:
+        return False
+    with contextlib.suppress(Exception):
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        PROCESS_SET_QUOTA = 0x0100
+        PROCESS_TERMINATE = 0x0001
+        handle = kernel32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid)
+        if not handle:
+            return False
+        try:
+            return bool(kernel32.AssignProcessToJobObject(job, handle))
+        finally:
+            kernel32.CloseHandle(handle)
+    return False
+
+
+def _spawn(argv: list[str], job: int | None = None) -> subprocess.Popen[bytes] | None:
+    """Launch a detached player process, or None on any failure.
+
+    Two requirements pull in opposite directions, and both are load-bearing:
+
+    * The player must survive the terminal losing focus. Minimizing the window
+      or Alt-Tabbing away would otherwise suspend a child tied to our console.
+    * The player must NOT survive this process dying. Closing the terminal with
+      the window X button kills us without running atexit, which used to strand
+      a detached ffplay playing forever.
+
+    Detaching (DETACHED_PROCESS on Windows, start_new_session on POSIX) buys
+    the first property but breaks the second. On Windows we recover the second
+    by assigning the child to a Job Object created with KILL_ON_JOB_CLOSE: the
+    kernel then terminates the player as soon as our last handle closes, no
+    matter how we exit. On POSIX there is no equivalent, so a pid file plus
+    :func:`reap_orphans` covers it instead.
     """
     devnull = subprocess.DEVNULL
     try:
@@ -331,7 +606,7 @@ def _spawn(argv: list[str]) -> subprocess.Popen[bytes] | None:
                 | subprocess.CREATE_NEW_PROCESS_GROUP
                 | subprocess.CREATE_NO_WINDOW
             )
-            return subprocess.Popen(
+            proc = subprocess.Popen(
                 argv,
                 stdin=devnull,
                 stdout=devnull,
@@ -339,6 +614,9 @@ def _spawn(argv: list[str]) -> subprocess.Popen[bytes] | None:
                 creationflags=flags,
                 close_fds=True,
             )
+            if job:
+                _assign_to_job(proc.pid, job)
+            return proc
         return subprocess.Popen(
             argv,
             stdin=devnull,
@@ -439,6 +717,10 @@ class MusicPlayer:
         self._reason = ""
         self._volume = max(0.0, min(1.0, float(volume)))
         self._paused = False
+        # Windows: a job object that kills the player when this process dies,
+        # so a detached player cannot outlive a terminal that was closed with
+        # the window X button. None elsewhere; the pid file covers POSIX.
+        self._job = _make_kill_on_close_job()
 
     def _volume_percent(self) -> int:
         """Requested volume as the 0-100 integer every player expects."""
@@ -491,7 +773,7 @@ class MusicPlayer:
                     if not shutil.which(prefix[0]):
                         continue
                     argv = [*prefix, path]
-                proc = _spawn(argv)
+                proc = _spawn(argv, self._job)
                 if proc is None:
                     continue
                 self._proc = proc
@@ -732,6 +1014,29 @@ class Music:
 
     _player: MusicPlayer | None = None
     _enabled = False
+    _track = "chiptune"
+
+    @classmethod
+    def track(cls) -> str:
+        """Name of the style currently selected."""
+        return cls._track
+
+    @classmethod
+    def set_track(cls, track: str) -> bool:
+        """Switch style, restarting playback if it was already running.
+
+        Returns True when the requested style is valid. Switching while stopped
+        simply records the choice; the next enable() renders it.
+        """
+        if track not in TRACKS:
+            return False
+        was_on = cls._enabled
+        if was_on:
+            cls.disable()
+        cls._track = track
+        if was_on:
+            cls.enable()
+        return True
 
     @classmethod
     def _get_player(cls) -> MusicPlayer:
@@ -757,7 +1062,7 @@ class Music:
         if not can_play:
             _debug(f"music unavailable: {backend}")
             return False
-        loop = generate_loop()
+        loop = generate_loop(track=cls._track)
         if not loop:
             _debug("music unavailable: no cached loop")
             return False

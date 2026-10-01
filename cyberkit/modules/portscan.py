@@ -19,11 +19,13 @@ from ..core.models import Finding, Host, Service
 from ..core.module import Module, register
 
 #: Ports scanned when the operator does not specify a list.
+#:
+#: A connect scan costs a full timeout per closed port, so a long list is a long
+#: wait. This is the high-signal web and remote-access set: it finds the services
+#: that matter in one pass. Pass -p to sweep a wider range deliberately.
 DEFAULT_PORTS = (
-    21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 389, 443, 445, 465, 587,
-    636, 993, 995, 1433, 1521, 2049, 2375, 3000, 3306, 3389, 5000, 5432,
-    5672, 5900, 6379, 8000, 8080, 8081, 8443, 8888, 9000, 9090, 9200, 9300,
-    11211, 27017,
+    21, 22, 25, 53, 80, 443, 445, 1433, 3306, 3389, 5432, 5900,
+    6379, 8080, 8443, 9200, 11211, 27017,
 )
 
 #: Services that speak first, so banner grabbing is a read rather than a write.

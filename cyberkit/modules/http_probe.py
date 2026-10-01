@@ -14,7 +14,11 @@ from ..core.http import Response, split_host_port
 from ..core.models import Finding, Host, Service
 from ..core.module import Module, register
 
-WEB_PORTS = (80, 443, 8080, 8000, 8888, 8443, 3000, 5000, 9000)
+#: Ports probed when the target names no port itself. Deliberately short: every
+#: closed port costs a full timeout, and a CDN-fronted host silently drops the
+#: connection instead of refusing it, so a long list made this module look hung
+#: (six dead ports x 5s). Wide sweeps are the port scanner's job, not this one's.
+WEB_PORTS = (80, 443, 8080)
 
 #: header -> (severity, title, remediation)
 _HEADER_CHECKS: dict[str, tuple[str, str, str]] = {

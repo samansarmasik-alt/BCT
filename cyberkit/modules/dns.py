@@ -9,10 +9,59 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import threading
+from collections.abc import Callable
+from functools import partial
 
 from ..core.http import split_host_port
 from ..core.models import Finding, Host
 from ..core.module import Module, register
+
+#: Wall-clock budget for one enrichment lookup. The Windows resolver can spend
+#: several seconds on a PTR or CNAME query that has no answer, and a scan that
+#: waits on it feels broken. One second keeps DNS useful without dominating.
+LOOKUP_BUDGET = 1.0
+
+
+def _ptr_name(address: str) -> str:
+    """Reverse-resolve one address, returning "" when there is no PTR record."""
+    try:
+        return socket.gethostbyaddr(address)[0]
+    except (socket.herror, socket.gaierror, OSError, UnicodeError):
+        return ""
+
+
+def _fqdn(name: str) -> str:
+    """Canonical name for a host, returning "" on resolver failure."""
+    try:
+        return socket.getfqdn(name)
+    except (socket.gaierror, OSError, UnicodeError):
+        return ""
+
+
+def _lookup_with_budget(fetch: Callable[[], str], host: Host, label: str) -> str:
+    """Run one blocking resolver call on a watchdog thread.
+
+    ``socket.gethostbyaddr`` and ``getfqdn`` cannot be interrupted, so the call
+    goes to a worker that is abandoned if it overruns. A daemon thread cannot
+    keep the process alive, which is what we want: a late answer is discarded
+    rather than blocking shutdown.
+    """
+    box: list[str] = []
+
+    def worker() -> None:
+        try:
+            box.append(fetch())
+        except (OSError, UnicodeError):
+            return
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(LOOKUP_BUDGET)
+    if thread.is_alive():
+        host.notes.append(f"{label} lookup exceeded {LOOKUP_BUDGET:.0f}s and was skipped")
+        return ""
+    return box[0] if box else ""
 
 
 @register
@@ -43,6 +92,10 @@ class DnsModule(Module):
             if address not in host.addresses:
                 host.addresses.append(address)
 
+        # Reverse and canonical lookups are enrichment, not the main result.
+        # The Windows resolver takes several seconds per PTR/CNAME query when a
+        # zone has no answer, so each one gets a short private budget; a slow
+        # resolver must not turn a 9 second scan into a 20 second one.
         self._reverse_lookup(host)
         self._follow_cname(host)
         self._check_ipv6(host)
@@ -50,11 +103,8 @@ class DnsModule(Module):
 
     def _reverse_lookup(self, host: Host) -> None:
         for address in list(host.addresses):
-            try:
-                name, _alias, _addr = socket.gethostbyaddr(address)
-            except (socket.herror, socket.gaierror, OSError):
-                continue
-            if name not in host.hostnames:
+            name = _lookup_with_budget(partial(_ptr_name, address), host, "PTR")
+            if name and name not in host.hostnames:
                 host.hostnames.append(name)
 
     def _follow_cname(self, host: Host) -> None:
@@ -62,9 +112,8 @@ class DnsModule(Module):
         seen: set[str] = {host.target.lower()}
         current = host.target
         for _ in range(6):
-            try:
-                canonical = socket.getfqdn(current)
-            except (socket.gaierror, OSError):
+            canonical = _lookup_with_budget(partial(_fqdn, current), host, "CNAME")
+            if not canonical:
                 return
             canonical = canonical.rstrip(".").lower()
             if not canonical or canonical in seen or canonical in {"localhost", host.target.lower()}:

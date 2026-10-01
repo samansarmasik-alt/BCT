@@ -399,7 +399,13 @@ class Matrix:
             self._drops = [self._rng.randrange(-self.rows, 0) for _ in range(self.columns)]
 
     def tick(self) -> None:
-        """Advance and draw exactly one frame."""
+        """Advance and draw exactly one frame.
+
+        The frame must be re-drawn in place: move the cursor up by the frame
+        height and erase downward before painting. Without that step every tick
+        appended another frame below the last, and the screen filled with
+        overlapping glyph rows.
+        """
         with self._lock:
             for col, head in enumerate(self._drops):
                 if 0 <= head < self.rows:
@@ -412,10 +418,15 @@ class Matrix:
                         self._grid[tail][col] = " "
                 self._drops[col] = (head + 1) % (self.rows + self._rng.randrange(4, 12))
             rows = ["".join(row) for row in self._grid]
+
         with contextlib.suppress(Exception):
             muted = ui.CURRENT.muted
             frame = "\n".join(ui.paint(row, muted, ui.DIM) for row in rows)
-            print(ui.CURSOR_HIDE + frame, file=self._stream, end="", flush=True)
+            # Move back to the top of the previous frame, then erase the rest.
+            home = f"\033[{self.rows}A" if ui.COLOR else ""
+            clear = ui.CLEAR_SCREEN if ui.COLOR else ""
+            with contextlib.suppress(Exception):
+                print(f"\r{home}{clear}{ui.CURSOR_HIDE}{frame}", file=self._stream, end="", flush=True)
 
     def _loop(self) -> None:
         while self._running:

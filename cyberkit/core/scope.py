@@ -17,6 +17,9 @@ from typing import Any
 from .http import split_host_port
 from .models import Finding
 
+#: Widest network that expand_targets will turn into individual addresses.
+MAX_EXPAND_ADDRESSES = 1024
+
 
 class ScopeViolation(RuntimeError):
     """Raised when a target is not covered by the declared scope."""
@@ -99,18 +102,31 @@ class Scope:
     def expand_targets(self, targets: Iterable[str]) -> list[str]:
         """Expand user input into concrete hosts, sorted and deduplicated.
 
-        Accepts a bare IP, a CIDR, or a hostname. CIDRs above /30 are refused
-        because expanding them would mean probing thousands of addresses on a
-        typo; the operator should be explicit about wide ranges instead.
+        Accepts a bare IP, a CIDR, a hostname, a full URL, or host:port. CIDRs
+        above /30 are refused because expanding them would mean probing
+        thousands of addresses on a typo; the operator should be explicit about
+        wide ranges instead.
         """
         expanded: list[str] = []
         for raw in targets:
             token = raw.strip()
             if not token:
                 continue
-            if "/" in token:
-                network = _as_network(token)
-                if network.num_addresses > 1024:
+
+            # A CIDR mask and a URL path both contain "/", and they must not be
+            # confused. Split the scheme off, then treat the remainder as a
+            # network only when it is a single slash-separated token that
+            # actually parses as an address prefix.
+            candidate = token.split("://", 1)[-1]
+            network = None
+            if candidate.count("/") == 1:
+                try:
+                    network = _as_network(candidate)
+                except ValueError:
+                    network = None
+
+            if network is not None:
+                if network.num_addresses > MAX_EXPAND_ADDRESSES:
                     raise ScopeViolation(
                         f"network {network} is too wide ({network.num_addresses} addresses); "
                         "list smaller ranges explicitly"
@@ -163,26 +179,31 @@ class Scope:
         return False
 
     def permits(self, target: str) -> bool:
-        """Allow if the literal, its resolution, or its name is in scope.
+        """Allow if the literal, its host portion, its resolution, or its name is in scope.
 
         Accepts ``host``, ``host:port`` and full URLs so operators can paste
         whatever they have; only the host portion is authorized.
         """
-        if self.permits_hostname(target):
-            return True
-
         host, _port = split_host_port(target)
-        if host != target and self.permits(host):
+
+        # Check the parsed host first. Comparing the raw string against the
+        # declared names can never match a URL, which silently denied every
+        # https:// target the scope gate was supposed to allow.
+        if host and (self.permits_hostname(host) or self._permits_literal(host)):
             return True
 
-        try:
-            ipaddress.ip_address(host)
-        except ValueError:
-            pass
-        else:
-            return self.permits_address(host)
+        if host and host != target and self.permits_hostname(target):
+            return True
 
-        return any(self.permits_address(info[4][0]) for info in _resolve(host))
+        return any(self.permits_address(info[4][0]) for info in _resolve(host or target))
+
+    def _permits_literal(self, value: str) -> bool:
+        """True when ``value`` is a literal IP that the scope admits."""
+        try:
+            ipaddress.ip_address(value)
+        except ValueError:
+            return False
+        return self.permits_address(value)
 
     def require(self, target: str) -> None:
         """Raise :class:`ScopeViolation` unless ``target`` is authorized."""

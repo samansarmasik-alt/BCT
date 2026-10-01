@@ -264,12 +264,10 @@ class App:
             except Exception as exc:
                 print(ui.paint(f" {i18n.t('scope.invalid')}: {exc}", ui.RED))
                 return None
-        scope = Scope(allow_private=True)
         host = _host_of(target)
-        if host is None:
+        if not host:
             return None
-        scope.host_entries.append(host)
-        return scope
+        return Scope(host_entries=[host], allow_private=True)
 
     def _write_report(self, result: Result) -> None:
         path = self.output or Path("out/report.html")

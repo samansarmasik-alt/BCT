@@ -26,10 +26,12 @@ import contextlib
 import math
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import wave
 from pathlib import Path
 from random import Random
@@ -42,6 +44,14 @@ MAX_SAMPLE_RATE = 48000
 CHORD_SECONDS = 8.0
 DEFAULT_LOOP_SECONDS = 32.0
 CACHE_NAME = "cyberkit_ambient.wav"
+
+#: Playback volume as a 0.0-1.0 fraction. Deliberately low: this is background
+#: ambience, and full-scale audio in a terminal app is startling and unpleasant.
+DEFAULT_VOLUME = 0.18
+
+#: Headroom applied to the rendered mix. Combined with DEFAULT_VOLUTE this keeps
+#: the loop well below clipping even when a player ignores its volume flag.
+MASTER_GAIN = 0.34
 
 _WAV = ".wav"
 
@@ -220,11 +230,11 @@ def _render_chord(index: int, sample_rate: int, rng: Random) -> array.array:
     return _soft_limit(block)
 
 
-def _to_pcm16(buf: array.array) -> bytes:
+def _to_pcm16(buf: array.array, gain: float = 1.0) -> bytes:
     """Convert -1..1 float samples to little-endian signed 16-bit PCM."""
     pcm = array.array("h", bytes(2 * len(buf)))
     for n, value in enumerate(buf):
-        scaled = int(value * 32767.0)
+        scaled = int(value * gain * 32767.0)
         if scaled > 32767:
             scaled = 32767
         elif scaled < -32768:
@@ -275,7 +285,7 @@ def render_clip(
         handle.setnchannels(1)
         handle.setsampwidth(2)
         handle.setframerate(rate)
-        handle.writeframes(_to_pcm16(mix))
+        handle.writeframes(_to_pcm16(mix, MASTER_GAIN))
     return str(target)
 
 
@@ -341,20 +351,49 @@ def _spawn(argv: list[str]) -> subprocess.Popen[bytes] | None:
         return None
 
 
-def _candidate_players() -> list[tuple[str, list[str]]]:
-    """Backend candidates as (name, argv-builder-free prefix) tried in order."""
+def _candidate_players(volume: int = 20) -> list[tuple[str, list[str]]]:
+    """Backend candidates as (name, argv prefix) tried in order.
+
+    ``volume`` is 0-100 and is passed to whichever player supports it, so the
+    ambience actually sits in the background instead of playing at full scale.
+    """
+    level = max(0, min(100, int(volume)))
     if os.name == "nt":
         return [
-            ("ffplay", ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-loop", "0"]),
-            ("mpv", ["mpv", "--no-video", "--really-quiet", "--loop=inf"]),
-            ("vlc", ["vlc", "-I", "dummy", "--play-and-exit", "--loop", "--no-video"]),
-            ("cvlc", ["cvlc", "-I", "dummy", "--play-and-exit", "--loop", "--no-video"]),
+            (
+                "ffplay",
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                 "-loop", "0", "-volume", str(level)],
+            ),
+            (
+                "mpv",
+                ["mpv", "--no-video", "--really-quiet", "--loop=inf",
+                 "--volume=" + str(level)],
+            ),
+            (
+                "vlc",
+                ["vlc", "-I", "dummy", "--play-and-exit", "--loop", "--no-video",
+                 "--volume", str(level * 256 // 100)],
+            ),
+            (
+                "cvlc",
+                ["cvlc", "-I", "dummy", "--play-and-exit", "--loop", "--no-video",
+                 "--volume", str(level * 256 // 100)],
+            ),
             ("powershell", ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ""]),
         ]
     return [
-        ("ffplay", ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-loop", "0"]),
-        ("mpv", ["mpv", "--no-video", "--really-quiet", "--loop=inf"]),
-        ("afplay", ["afplay"]),
+        (
+            "ffplay",
+            ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+             "-loop", "0", "-volume", str(level)],
+        ),
+        (
+            "mpv",
+            ["mpv", "--no-video", "--really-quiet", "--loop=inf",
+             "--volume=" + str(level)],
+        ),
+        ("afplay", ["afplay", "-v", f"{level / 100:.2f}"]),
         ("paplay", ["paplay"]),
     ]
 
@@ -392,7 +431,7 @@ class MusicPlayer:
     a signal handler while the render is still running.
     """
 
-    def __init__(self, volume: float = 0.6) -> None:
+    def __init__(self, volume: float = DEFAULT_VOLUME) -> None:
         self._lock = threading.RLock()
         self._proc: subprocess.Popen[bytes] | None = None
         self._winsound_sound: object | None = None
@@ -400,6 +439,10 @@ class MusicPlayer:
         self._reason = ""
         self._volume = max(0.0, min(1.0, float(volume)))
         self._paused = False
+
+    def _volume_percent(self) -> int:
+        """Requested volume as the 0-100 integer every player expects."""
+        return max(0, min(100, round(self._volume * 100)))
 
     @property
     def backend_name(self) -> str:
@@ -410,6 +453,14 @@ class MusicPlayer:
     def reason(self) -> str:
         """Why the last play attempt failed, if it did."""
         return self._reason
+
+    @property
+    def pid(self) -> int:
+        """PID of the detached player, or 0 when nothing is running."""
+        with self._lock:
+            if self._proc is None:
+                return 0
+            return self._proc.pid or 0
 
     def is_playing(self) -> bool:
         with self._lock:
@@ -428,7 +479,7 @@ class MusicPlayer:
             if not os.path.isfile(path):
                 self._reason = f"audio file missing: {path}"
                 return False
-            for name, prefix in _candidate_players():
+            for name, prefix in _candidate_players(self._volume_percent()):
                 if name == "powershell":
                     if not shutil.which(prefix[0]):
                         continue
@@ -470,13 +521,10 @@ class MusicPlayer:
         )
 
     def _play_winsound(self, path: str) -> bool:
-        """Final Windows fallback.
+        """Final Windows fallback, played at a low level.
 
-        Limitation (documented on purpose): winsound.PlaySound with SND_LOOP only
-        works for uncompressed WAV, and there is no reliable way to stop a
-        SND_LOOPed sound - stop() clears our handle but the sound may keep
-        going until it ends. That is why this is only the last fallback and
-        every other backend is preferred.
+        winsound has no volume argument, so the low level is baked into the
+        rendered mix instead - that is why MASTER_GAIN exists.
         """
         if not _winsound_available():
             return False
@@ -502,23 +550,36 @@ class MusicPlayer:
             proc, self._proc = self._proc, None
             self._paused = False
             if proc is not None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=1.5)
-                except Exception:
-                    with contextlib.suppress(Exception):
-                        proc.kill()
-                    with contextlib.suppress(Exception):
-                        proc.wait(timeout=1.5)
+                self._reap(proc)
             if self._winsound_sound is not None:
                 self._winsound_sound = None
-                try:
+                with contextlib.suppress(Exception):
                     import winsound
 
                     winsound.PlaySound(None, winsound.SND_PURGE)
-                except Exception:
-                    pass
             self._backend = ""
+
+    @staticmethod
+    def _reap(proc: subprocess.Popen[bytes], grace: float = 0.35) -> None:
+        """Kill the player fast, then confirm it is actually gone.
+
+        The old code waited 1.5s for a graceful exit before escalating to
+        kill(), which is exactly why closing the terminal felt like it hung for
+        two seconds. A player that must be silenced is better killed
+        immediately: the wait only mattered for a clean audio fade we do not
+        need.
+        """
+        with contextlib.suppress(Exception):
+            proc.terminate()
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                return
+            time.sleep(0.02)
+        with contextlib.suppress(Exception):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=0.5)
 
     def pause(self) -> bool:
         """Suspend playback. Returns False when the backend cannot pause."""
@@ -553,7 +614,11 @@ class MusicPlayer:
                 return False
 
     def set_volume(self, volume: float) -> None:
-        """Clamp and store the requested volume (applied by the backend)."""
+        """Store the requested volume and push it to a live backend.
+
+        ffplay and mpv accept it at startup; changing it on a running process
+        would need a control pipe, so the new value applies on the next play.
+        """
         with self._lock:
             self._volume = max(0.0, min(1.0, float(volume)))
 
@@ -571,6 +636,95 @@ def _debug(message: str) -> None:
     _reported = True
     with contextlib.suppress(Exception):
         print(f"[audio] {message}", file=sys.stderr)
+
+
+# --- Orphan protection -------------------------------------------------------
+#
+# A player is started DETACHED so it survives losing terminal focus. The cost of
+# that is that closing the terminal with the window X button kills this process
+# without running atexit, which used to leave ffplay/mpv running forever.
+#
+# Fix: persist the player PID to a small file next to the cached loop. The next
+# launch reaps any PID recorded there before starting a new one, so an orphaned
+# player can outlive at most one session.
+
+
+def _pid_file() -> Path:
+    return Path(tempfile.gettempdir()) / "cyberkit_audio.pid"
+
+
+def _record_pid(pid: int) -> None:
+    if pid <= 0:
+        return
+    with contextlib.suppress(Exception):
+        _pid_file().write_text(str(pid), encoding="utf-8")
+
+
+def _forget_pid() -> None:
+    with contextlib.suppress(Exception):
+        _pid_file().unlink(missing_ok=True)
+
+
+def _pid_alive(pid: int) -> bool:
+    """True when a process with this PID exists (and is not a zombie)."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+
+    with contextlib.suppress(Exception):
+        os.kill(pid, 0)
+        return True
+    return False
+
+
+def reap_orphans() -> int:
+    """Kill any player left behind by a previous run. Returns how many died."""
+    path = _pid_file()
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return 0
+    if not raw.isdigit():
+        _forget_pid()
+        return 0
+
+    pid = int(raw)
+    _forget_pid()
+    if not _pid_alive(pid):
+        return 0
+
+    killed = 0
+    if os.name == "nt":
+        with contextlib.suppress(Exception):
+            import ctypes
+
+            handle = ctypes.windll.kernel32.OpenProcess(0x0001, False, pid)
+            if handle:
+                ctypes.windll.kernel32.TerminateProcess(handle, 0)
+                ctypes.windll.kernel32.CloseHandle(handle)
+            killed = 1
+    else:
+        with contextlib.suppress(Exception):
+            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            killed = 1
+    _debug(f"reaped orphaned audio player pid={pid}")
+    return killed
 
 
 class Music:
@@ -595,6 +749,10 @@ class Music:
         """Render once if needed and start playback. No-op when unavailable."""
         if cls._enabled:
             return True
+
+        # A player orphaned by a previous session would overlap with this one.
+        reap_orphans()
+
         can_play, backend = available()
         if not can_play:
             _debug(f"music unavailable: {backend}")
@@ -607,6 +765,7 @@ class Music:
         if not player.play(loop):
             _debug(f"music unavailable: {player.reason or backend}")
             return False
+        _record_pid(player.pid)
         cls._enabled = True
         return True
 
@@ -615,6 +774,7 @@ class Music:
         """Stop playback and release the player."""
         if cls._player is not None:
             cls._player.stop()
+        _forget_pid()
         cls._enabled = False
 
     @classmethod

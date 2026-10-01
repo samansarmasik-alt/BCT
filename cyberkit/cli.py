@@ -78,13 +78,19 @@ def _scope_for(targets: list[str], allow_all: bool) -> Scope:
     that statement -- so the assertion is recorded in the scope file and in the
     report rather than being silently assumed.
     """
-    scope = Scope(allow_private=True)
+    names: list[str] = []
     for target in targets:
         if "://" in target:
             host, _port = split_host_port(target)
-            scope.host_entries.append(host)
         else:
-            scope.host_entries.append(target)
+            host = target
+        if host and host not in names:
+            names.append(host)
+
+    # Build the entries first and let the constructor index them. Appending to
+    # host_entries after construction left the lookup index empty, so every URL
+    # target was silently denied by the scope gate.
+    scope = Scope(host_entries=names, allow_private=True)
     if allow_all:
         scope.notes.append("authorization asserted by operator via --allow-all")
     return scope

@@ -78,6 +78,35 @@ class ScopeTests(unittest.TestCase):
         with self.assertRaises(ScopeViolation):
             Scope().expand_targets(["10.0.0.0/8"])
 
+    def test_url_target_is_not_mistaken_for_cidr(self) -> None:
+        # A URL path contains "/", which used to be parsed as a network mask
+        # and aborted the run before anything was scanned.
+        scope = Scope()
+        self.assertEqual(
+            scope.expand_targets(["https://example.com/a/b"]),
+            ["https://example.com/a/b"],
+        )
+
+    def test_narrow_network_expands_to_addresses(self) -> None:
+        self.assertEqual(
+            Scope().expand_targets(["10.0.0.0/30"]),
+            ["10.0.0.1", "10.0.0.2"],
+        )
+
+    def test_url_target_is_permitted_by_name(self) -> None:
+        scope = Scope(host_entries=["example.com"])
+        self.assertTrue(scope.permits("https://example.com"))
+        self.assertTrue(scope.permits("example.com:8443"))
+        self.assertFalse(scope.permits("https://evil.example.org"))
+
+    def test_scope_for_target_actually_permits_it(self) -> None:
+        # Regression: entries were appended after construction, leaving the
+        # lookup index empty so every pasted URL was silently denied.
+        from cyberkit.cli import _scope_for
+
+        scope = _scope_for(["https://example.com"], allow_all=False)
+        self.assertTrue(scope.permits("https://example.com"))
+
     def test_scope_file_roundtrip(self) -> None:
         import tempfile
         from pathlib import Path

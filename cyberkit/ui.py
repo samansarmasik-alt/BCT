@@ -45,6 +45,35 @@ CLEAR_SCREEN = "\033[2J\033[H"
 FAST = False
 
 
+def force_utf8() -> bool:
+    """Reconfigure stdout/stderr to UTF-8 so box drawing survives.
+
+    A Turkish Windows console defaults to cp1254, and the C runtime picks that up
+    regardless of ``chcp 65001`` in the parent batch file. Every glyph outside
+    cp1254 - which is all of the box drawing and block characters the advanced
+    theme uses - then arrives as "?" and the interface turns to noise. Forcing
+    UTF-8 here, at import time, is the one place that fixes it for every entry
+    point.
+
+    Returns True when a stream was actually reconfigured.
+    """
+    changed = False
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            reconfigure = stream.reconfigure  # type: ignore[union-attr]
+        except (AttributeError, ValueError):
+            continue
+        encoding = (getattr(stream, "encoding", "") or "").lower().replace("-", "")
+        if encoding in {"utf8", "utf8sig"}:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+            changed = True
+        except (ValueError, OSError, AttributeError):
+            continue
+    return changed
+
+
 def _windows_vt_enabled(stream: IO[str]) -> bool:
     """True when a Windows console can be switched into VT processing mode."""
     if os.name != "nt":
@@ -77,6 +106,11 @@ def detect_color(stream: IO[str] | None = None) -> bool:
     return _windows_vt_enabled(target)
 
 
+#: Reconfigure the streams before any capability probe reads their encoding,
+#: otherwise supports_unicode() inspects cp1254 and picks the ASCII theme even
+#: though the console can in fact draw the full set.
+force_utf8()
+
 COLOR = detect_color()
 
 
@@ -106,8 +140,30 @@ def _encoding_ok(stream: IO[str], probes: str) -> bool:
 
 
 def supports_unicode() -> bool:
-    """False when the active codepage cannot draw box or block characters."""
-    return _encoding_ok(sys.stdout, "\u2500\u2588\u25b2\u2022")
+    """False when the console cannot draw box or block characters.
+
+    Checked against the console output code page as well as the Python encoding.
+    A pipe or a legacy console answers False, which is what keeps the interface
+    legible instead of a field of question marks.
+    """
+    if not _encoding_ok(sys.stdout, "\u2500\u2588\u25b2\u2022"):
+        return False
+    return _console_codepage_is_utf8()
+
+
+def _console_codepage_is_utf8() -> bool:
+    """True when the Windows console itself is on code page 65001."""
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetConsoleOutputCP.restype = ctypes.c_uint32
+        return int(kernel32.GetConsoleOutputCP()) == 65001
+    except Exception:
+        # No console attached (a pipe or a service): trust the stream encoding.
+        return True
 
 
 def _safe(text: str) -> str:

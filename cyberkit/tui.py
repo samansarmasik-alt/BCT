@@ -83,10 +83,13 @@ class App:
 
     def header(self, title: str) -> None:
         theme = ui.CURRENT
+        # Use the theme's own rule glyph so an advanced session is framed in box
+        # drawing rather than ASCII, and a basic one stays plain on purpose.
+        edge = theme.g("h") or "="
         print()
-        print(ui.paint(ui.rule("=", 72), theme.accent))
+        print(ui.paint(edge * 72, theme.accent))
         print(ui.paint(title.center(72), ui.BOLD, theme.accent))
-        print(ui.paint(ui.rule("=", 72), theme.accent))
+        print(ui.paint(edge * 72, theme.accent))
         mode = i18n.t("mode.advanced") if self.advanced else i18n.t("mode.basic")
         print(
             ui.paint(f" {mode} ", ui.BOLD, ui.BG_BLACK, theme.accent)

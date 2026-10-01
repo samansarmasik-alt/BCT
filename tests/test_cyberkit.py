@@ -47,6 +47,77 @@ class _Handler(BaseHTTPRequestHandler):
         return None
 
 
+class AudioTests(unittest.TestCase):
+    """Music engine: no playback, just rendering and math."""
+
+    def test_every_track_renders_and_is_well_formed(self) -> None:
+        import tempfile
+        import wave
+        from pathlib import Path
+
+        from cyberkit import audio
+
+        self.assertTrue(audio.available_tracks())
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in audio.available_tracks():
+                path = audio.render_chiptune(
+                    str(Path(tmp) / f"{name}.wav"), seconds=3.0, track=name
+                )
+                self.assertTrue(Path(path).is_file(), name)
+                with wave.open(path) as handle:
+                    self.assertEqual(handle.getnchannels(), 1)
+                    self.assertEqual(handle.getsampwidth(), 2)
+                    self.assertGreater(handle.getnframes(), 1000, name)
+
+    def test_tracks_are_loudness_matched(self) -> None:
+        import array
+        import tempfile
+        import wave
+        from pathlib import Path
+
+        from cyberkit import audio
+
+        levels: list[float] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in audio.available_tracks():
+                path = audio.render_chiptune(
+                    str(Path(tmp) / f"{name}.wav"), seconds=6.0, track=name
+                )
+                with wave.open(path) as handle:
+                    raw = handle.readframes(handle.getnframes())
+                samples = array.array("h")
+                samples.frombytes(raw)
+                peak = max(abs(v) for v in samples) / 32767.0
+                levels.append(peak)
+        # Normalization exists so switching tracks is not jarring; a wide
+        # spread means it regressed.
+        self.assertLess(max(levels) - min(levels), 0.75, levels)
+
+    def test_render_is_deterministic(self) -> None:
+        import tempfile
+        import wave
+        from pathlib import Path
+
+        from cyberkit import audio
+
+        with tempfile.TemporaryDirectory() as tmp:
+            a = audio.render_chiptune(str(Path(tmp) / "a.wav"), seconds=3.0, track="hope")
+            b = audio.render_chiptune(str(Path(tmp) / "b.wav"), seconds=3.0, track="hope")
+            with wave.open(a) as wa, wave.open(b) as wb:
+                self.assertEqual(wa.readframes(wa.getnframes()),
+                                 wb.readframes(wb.getnframes()))
+
+    def test_unknown_track_is_rejected(self) -> None:
+        from cyberkit import audio
+
+        self.assertFalse(audio.Music.set_track("does-not-exist"))
+
+    def test_default_track_is_in_library(self) -> None:
+        from cyberkit import audio
+
+        self.assertIn(audio.Music.track(), audio.available_tracks())
+
+
 class ScopeTests(unittest.TestCase):
     def test_loopback_allowed_by_default(self) -> None:
         scope = Scope(cidr_entries=["127.0.0.0/8"])

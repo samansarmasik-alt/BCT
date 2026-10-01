@@ -210,10 +210,11 @@ class App:
             print(ui.paint(f" {i18n.t('music.unavailable')}", ui.YELLOW))
 
     def next_track(self) -> None:
-        """Cycle to the next music style and play it if music is on."""
+        """Cycle to the next composition and play it if music is on."""
+        tracks = audio.available_tracks()
         current = audio.Music.track()
-        index = (audio.TRACKS.index(current) + 1) % len(audio.TRACKS) if current in audio.TRACKS else 0
-        target = audio.TRACKS[index]
+        index = (tracks.index(current) + 1) % len(tracks) if current in tracks else 0
+        target = tracks[index]
         was_on = audio.Music.is_enabled()
         audio.Music.set_track(target)
         if was_on:

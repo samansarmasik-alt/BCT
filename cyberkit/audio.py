@@ -143,6 +143,138 @@ def _soft_limit(buf: array.array) -> array.array:
     return buf
 
 
+def _highpass(buf: array.array, cutoff_hz: float, sample_rate: int) -> array.array:
+    """One-pole high-pass; removes DC and mud from a pad."""
+    alpha = 1.0 - math.exp(-2.0 * math.pi * cutoff_hz / sample_rate)
+    prev_in = 0.0
+    prev_out = 0.0
+    for n in range(len(buf)):
+        current = buf[n]
+        prev_out = alpha * (prev_out + current - prev_in)
+        prev_in = current
+        buf[n] = prev_out
+    return buf
+
+
+def _echo(buf: array.array, delay_s: float, feedback: float, sample_rate: int) -> array.array:
+    """In-place feedback delay, used for the wide, spacey tail."""
+    step = max(1, int(delay_s * sample_rate))
+    for n in range(step, len(buf)):
+        buf[n] += buf[n - step] * feedback
+    return buf
+
+
+def _reverb(buf: array.array, sample_rate: int, *, mix: float = 0.3) -> array.array:
+    """Cheap Schroeder-style reverb: three combs into one allpass.
+
+    Not a convolution impulse - just enough tail to stop the dry chiptune from
+    sounding like it was recorded in an empty box.
+    """
+    original = array.array("d", buf)
+    out = array.array("d", bytes(8 * len(buf)))
+    for delay_ms, fb in ((37, 0.78), (43, 0.74), (53, 0.70)):
+        step = max(1, int(delay_ms * sample_rate / 1000.0))
+        line = 0.0
+        for n in range(len(out)):
+            line += original[n]
+            line -= line / (fb * 6.0)
+            out[n] += line * 0.3
+    step = max(1, int(17 * sample_rate / 1000.0))
+    for n in range(step, len(out)):
+        out[n] += (1.0 - 0.5) * out[n - step] - 0.5 * original[n]
+    for n in range(len(out)):
+        buf[n] = original[n] * (1.0 - mix) + out[n] * mix
+    return buf
+
+
+def _pluck(buf: array.array, cutoff_hz: float, sample_rate: int) -> array.array:
+    """Bright, short decay: the classic synthesized-string timbre."""
+    _lowpass(buf, cutoff_hz, sample_rate)
+    return buf
+
+
+class Channel:
+    """One synth voice: waveform, envelope, filter and send levels.
+
+    Keeping the parts explicit is what lets a track read as an arrangement
+    rather than a single blended pad.
+    """
+
+    def __init__(
+        self,
+        wave: str = "pulse",
+        gain: float = 0.2,
+        attack: float = 0.01,
+        release: float = 0.12,
+        cutoff: float = 3800.0,
+        duty: float = 0.25,
+        vibrato_hz: float = 0.0,
+        vibrato_cents: float = 0.0,
+        detune: float = 0.0,
+    ) -> None:
+        self.wave = wave
+        self.gain = gain
+        self.attack = attack
+        self.release = release
+        self.cutoff = cutoff
+        self.duty = duty
+        self.vibrato_hz = vibrato_hz
+        self.vibrato_cents = vibrato_cents
+        self.detune = detune
+
+    def render(self, hz: float, seconds: float, sample_rate: int) -> array.array:
+        total = int(seconds * sample_rate)
+        if total <= 0:
+            return array.array("d")
+
+        if self.wave == "pulse":
+            note = _pulse(hz, seconds, sample_rate, self.duty)
+        elif self.wave == "triangle":
+            note = _triangle(hz, seconds, sample_rate)
+        elif self.wave == "sine":
+            note = _sine(hz, seconds, sample_rate)
+        elif self.wave == "organ":
+            note = array.array("d", bytes(8 * total))
+            for harmonic, weight in ((1, 0.6), (2, 0.3), (3, 0.22), (4, 0.14), (6, 0.08)):
+                partial = _sine(hz * harmonic, seconds, sample_rate)
+                for n in range(total):
+                    note[n] += partial[n] * weight
+        else:  # "saw"
+            note = _saw(hz, seconds, sample_rate)
+
+        if self.detune:
+            shifted = _sine(hz * (1.0 + self.detune), seconds, sample_rate)
+            for n in range(total):
+                note[n] = (note[n] + shifted[n]) * 0.5
+
+        if self.vibrato_hz and self.vibrato_cents:
+            depth = self.vibrato_cents / 1200.0
+            for n in range(total):
+                wobble = 1.0 + depth * math.sin(2.0 * math.pi * self.vibrato_hz * n / sample_rate)
+                note[n] *= wobble
+
+        env = _adsr(total, self.attack, self.release, sample_rate, sustain=0.75)
+        for n in range(total):
+            note[n] *= env[n] * self.gain
+        return _lowpass(note, self.cutoff, sample_rate)
+
+
+def _saw(freq: float, seconds: float, sample_rate: int) -> array.array:
+    """Band-limited-ish sawtooth via a summed harmonic series."""
+    count = int(seconds * sample_rate)
+    out = array.array("d", bytes(8 * count))
+    partials = min(24, max(1, int(sample_rate / max(1.0, freq) / 2)))
+    for harmonic in range(1, partials + 1):
+        weight = 1.0 / harmonic
+        tone = _sine(freq * harmonic, seconds, sample_rate, phase=harmonic * 0.7)
+        for n in range(count):
+            out[n] += tone[n] * weight
+    norm = 1.0 / max(1.0, sum(1.0 / h for h in range(1, partials + 1)))
+    for n in range(count):
+        out[n] *= norm
+    return out
+
+
 def _mix_into(dest: array.array, src: array.array, gain: float, offset: int = 0) -> None:
     """Add ``src`` into ``dest`` at a sample offset, skipping out-of-range parts."""
     start = max(0, offset)
@@ -176,6 +308,334 @@ def _clamp_rate(sample_rate: int) -> int:
 
 def _note_hz(root_hz: float, semitones: int) -> float:
     return root_hz * (2.0 ** (semitones / 12.0))
+
+
+# --- Music engine -----------------------------------------------------------
+#
+# A track is data, not code: a tempo, a chord progression and a list of events.
+# The renderer is shared by every track, which keeps the sound consistent and
+# means a new track is a melody and some chords rather than new DSP.
+#
+# Everything here is an original composition. Nothing is transcribed.
+
+
+class Event:
+    """One scheduled note: when it starts, how long, which pitch, on what voice."""
+
+    __slots__ = ("beat", "channel", "length", "semitone", "velocity")
+
+    def __init__(
+        self,
+        beat: float,
+        length: float,
+        semitone: int,
+        channel: Channel,
+        velocity: float = 1.0,
+    ) -> None:
+        self.beat = beat
+        self.length = length
+        self.semitone = semitone
+        self.channel = channel
+        self.velocity = velocity
+
+
+class Track:
+    """A complete piece: tempo, chords, melody and arrangement."""
+
+    def __init__(
+        self,
+        name: str,
+        root_hz: float,
+        bpm: float,
+        progression: tuple[int, ...],
+        events: tuple[Event, ...],
+        lead: Channel,
+        pad: Channel,
+        bass: Channel,
+        *,
+        beats_per_bar: int = 4,
+        swing: float = 0.0,
+        reverb: float = 0.26,
+        arp: tuple[Channel, ...] = (),
+    ) -> None:
+        self.name = name
+        self.root_hz = root_hz
+        self.bpm = bpm
+        self.progression = progression
+        self.events = events
+        self.lead = lead
+        self.pad = pad
+        self.bass = bass
+        self.beats_per_bar = beats_per_bar
+        self.swing = swing
+        self.reverb = reverb
+        self.arp = arp
+
+    @property
+    def beat_seconds(self) -> float:
+        return 60.0 / self.bpm
+
+    def duration(self) -> float:
+        if not self.events:
+            return 1.0
+        last = max(e.beat + e.length for e in self.events)
+        return last * self.beat_seconds + 2.0
+
+    def chord_at(self, beat: float) -> int:
+        """Semitone root of the chord covering ``beat``.
+
+        One chord per bar keeps the harmony simple and lets the melody move over
+        a slow, predictable bed, which is the whole point of the style.
+        """
+        bars = max(1, int(beat))
+        return self.progression[(bars // self.beats_per_bar) % len(self.progression)]
+
+    def render(self, sample_rate: int, seconds: float | None = None) -> array.array:
+        length = seconds or self.duration()
+        total = int(length * sample_rate)
+        mix = array.array("d", bytes(8 * total))
+        beat = self.beat_seconds
+
+        for event in self.events:
+            # A touch of swing on the off-beats keeps the pulse from feeling
+            # mechanical; straight eighths read as a metronome.
+            start_beat = event.beat
+            if self.swing and abs(event.beat - round(event.beat)) > 0.4:
+                start_beat += self.swing
+            offset = int(max(0.0, start_beat) * beat * sample_rate)
+            if offset >= total:
+                continue
+
+            root = self.chord_at(event.beat)
+            channel = event.channel
+            hz = _note_hz(self.root_hz, root + event.semitone)
+            # event.velocity scales the voice without rebuilding the note
+            voiced = Channel(
+                channel.wave,
+                channel.gain * event.velocity,
+                channel.attack,
+                channel.release,
+                channel.cutoff,
+                channel.duty,
+                channel.vibrato_hz,
+                channel.vibrato_cents,
+                channel.detune,
+            )
+            note = voiced.render(hz, min(event.length, length) * beat, sample_rate)
+            _mix_into(mix, note, 1.0, offset)
+
+        if self.reverb > 0:
+            _reverb(mix, sample_rate, mix=self.reverb)
+        return _soft_limit(mix)
+
+
+# --- Shared voices ----------------------------------------------------------
+
+LEAD_BRIGHT = Channel("pulse", gain=0.20, attack=0.008, release=0.10, cutoff=4200.0, duty=0.25)
+LEAD_SOFT = Channel("pulse", gain=0.17, attack=0.030, release=0.22, cutoff=2600.0, duty=0.5)
+LEAD_TRI = Channel("triangle", gain=0.22, attack=0.012, release=0.16, cutoff=3400.0)
+LEAD_SAW = Channel("saw", gain=0.14, attack=0.020, release=0.20, cutoff=2400.0)
+LEAD_ORGAN = Channel("organ", gain=0.11, attack=0.060, release=0.30, cutoff=2200.0)
+LEAD_VIBRATO = Channel(
+    "triangle", gain=0.18, attack=0.080, release=0.40, cutoff=2800.0,
+    vibrato_hz=5.2, vibrato_cents=14.0,
+)
+
+PAD_WARM = Channel("triangle", gain=0.085, attack=0.50, release=1.10, cutoff=2000.0, detune=0.004)
+PAD_GLASS = Channel("sine", gain=0.075, attack=0.80, release=1.40, cutoff=3000.0, detune=0.007)
+PAD_DARK = Channel("saw", gain=0.055, attack=0.90, release=1.60, cutoff=900.0)
+
+BASS_DEEP = Channel("triangle", gain=0.16, attack=0.02, release=0.30, cutoff=500.0)
+BASS_SOFT = Channel("sine", gain=0.18, attack=0.05, release=0.45, cutoff=380.0)
+
+
+# --- Original compositions --------------------------------------------------
+#
+# Four pieces, each an original melody written for this toolkit. They share the
+# engine above but not their material: a hopeful chiptune, a minor-key lullaby,
+# a driving bass-led groove, and a sparse, late-night one.
+
+
+def _pad_voicing(track_roots: tuple[int, ...], channel: Channel) -> tuple[Event, ...]:
+    """Hold a four-note voicing under every chord for the length of the piece."""
+    events: list[Event] = []
+    bars = len(track_roots) * 2
+    for bar in range(bars):
+        root = track_roots[(bar // 2) % len(track_roots)]
+        for voice, interval in enumerate((0, 7, 12, 16)):
+            events.append(
+                Event(bar * 4, 4.0, root + 12 + interval, channel, 1.0 - voice * 0.12)
+            )
+    return tuple(events)
+
+
+def _bass_roots(track_roots: tuple[int, ...], channel: Channel, style: str = "pulse") -> tuple[Event, ...]:
+    """Root movement for the bass: one long note, or a driving eighth pattern."""
+    events: list[Event] = []
+    bars = len(track_roots) * 2
+    for bar in range(bars):
+        root = track_roots[(bar // 2) % len(track_roots)]
+        if style == "pulse":
+            for step in range(8):
+                semitone = root if step in (0, 3, 6) else root + (7 if step % 2 else 0)
+                events.append(Event(bar * 4 + step * 0.5, 0.45, semitone - 12, channel))
+        else:
+            events.append(Event(bar * 4, 2.0, root - 12, channel))
+            events.append(Event(bar * 4 + 2.0, 2.0, root - 5, channel, 0.8))
+    return tuple(events)
+
+
+def track_hope() -> Track:
+    """Bright, forward-leaning chiptune. The default."""
+    roots = (0, 5, 3, 7)  # i - IV - III - VII
+    events: list[Event] = list(_pad_voicing(roots, PAD_WARM))
+    events += list(_bass_roots(roots, BASS_DEEP, "pulse"))
+
+    # A rising line that resolves and lifts: 4 bars, each one a phrase.
+    phrase = (
+        (0, 12, 1.0), (1, 16, 0.5), (2, 19, 0.5), (3, 16, 1.0), (4, 14, 1.0),
+        (5, 12, 0.5), (6, 16, 0.5), (7, 19, 2.0), (8, 21, 1.0), (9, 19, 0.5),
+        (10, 16, 0.5), (11, 12, 2.0), (12, 17, 0.5), (13, 19, 0.5), (14, 21, 1.0),
+        (15, 24, 3.0),
+    )
+    for repeat in range(4):
+        shift = repeat * 16
+        for beat, semitone, length in phrase:
+            events.append(Event(shift + beat, length, semitone, LEAD_BRIGHT))
+
+    # A counter-line in the back half, an octave up, to keep it moving.
+    for repeat in range(2):
+        shift = 32 + repeat * 16
+        for beat, semitone, length in ((0, 24, 0.5), (2, 21, 0.5), (4, 19, 0.5),
+                                       (6, 21, 0.5), (8, 24, 1.0), (12, 26, 0.5),
+                                       (14, 24, 0.5)):
+            events.append(Event(shift + beat, length, semitone, LEAD_TRI, 0.7))
+
+    return Track(
+        "hope",
+        root_hz=220.0,
+        bpm=104.0,
+        progression=roots,
+        events=tuple(events),
+        lead=LEAD_BRIGHT,
+        pad=PAD_WARM,
+        bass=BASS_DEEP,
+    )
+
+
+def track_lullaby() -> Track:
+    """Slow and minor. Deliberately sparse, long release on every note."""
+    roots = (0, 8, 3, 5)  # i - VI - iv - v
+    events: list[Event] = list(_pad_voicing(roots, PAD_GLASS))
+    events += list(_bass_roots(roots, BASS_SOFT, "long"))
+
+    phrase = (
+        (0, 12, 2.0), (2, 15, 1.0), (3, 19, 1.0), (4, 17, 2.0), (6, 15, 2.0),
+        (8, 12, 2.0), (10, 10, 1.0), (11, 12, 1.0), (12, 8, 4.0),
+        (16, 15, 2.0), (18, 19, 1.0), (19, 22, 1.0), (20, 19, 2.0), (22, 17, 2.0),
+        (24, 15, 2.0), (26, 12, 1.0), (27, 10, 1.0), (28, 7, 4.0),
+    )
+    for repeat in range(3):
+        shift = repeat * 32
+        for beat, semitone, length in phrase:
+            events.append(Event(shift + beat, length, semitone, LEAD_VIBRATO, 0.9))
+
+    return Track(
+        "lullaby",
+        root_hz=196.0,
+        bpm=68.0,
+        progression=roots,
+        events=tuple(events),
+        lead=LEAD_VIBRATO,
+        pad=PAD_GLASS,
+        bass=BASS_SOFT,
+        reverb=0.34,
+    )
+
+
+def track_drive() -> Track:
+    """Faster, bass-forward, with a syncopated lead. For working, not resting."""
+    roots = (0, 2, 5, 3)  # i - ii - IV - III
+    events: list[Event] = list(_pad_voicing(roots, PAD_DARK))
+    events += list(_bass_roots(roots, BASS_DEEP, "pulse"))
+
+    # Eighth-note figure with rests, which is what makes it drive.
+    figure = (
+        (0, 12, 0.5), (1.5, 19, 0.5), (2, 16, 0.5), (3, 19, 0.5),
+        (4, 21, 0.5), (5.5, 16, 0.5), (6, 12, 0.5), (7, 14, 0.5),
+        (8, 12, 0.5), (9.5, 19, 0.5), (10, 16, 0.5), (11, 19, 0.5),
+        (12, 24, 0.5), (13.5, 19, 0.5), (14, 16, 0.5), (15, 12, 0.5),
+    )
+    for repeat in range(4):
+        shift = repeat * 16
+        for beat, semitone, length in figure:
+            events.append(Event(shift + beat, length, semitone, LEAD_SAW, 0.95))
+
+    # Bass reinforcement on the off-beats.
+    for repeat in range(4):
+        shift = repeat * 16
+        for beat in range(0, 16, 2):
+            events.append(Event(shift + beat + 1.0, 0.4, 12, BASS_DEEP, 0.7))
+
+    return Track(
+        "drive",
+        root_hz=233.0,
+        bpm=138.0,
+        progression=roots,
+        events=tuple(events),
+        lead=LEAD_SAW,
+        pad=PAD_DARK,
+        bass=BASS_DEEP,
+        swing=0.06,
+        reverb=0.18,
+    )
+
+
+def track_night() -> Track:
+    """Sparse and wide. Long silences, high shimmer, almost no rhythm."""
+    roots = (0, 3, 10, 5)  # i - III - VII - v
+    events: list[Event] = list(_pad_voicing(roots, PAD_GLASS))
+    events += list(_bass_roots(roots, BASS_SOFT, "long"))
+
+    phrase = (
+        (0, 24, 4.0), (6, 19, 2.0), (10, 15, 2.0), (14, 12, 6.0),
+        (24, 26, 4.0), (30, 22, 2.0), (34, 19, 2.0), (38, 17, 6.0),
+    )
+    for repeat in range(2):
+        shift = repeat * 48
+        for beat, semitone, length in phrase:
+            events.append(Event(shift + beat, length, semitone, LEAD_VIBRATO, 0.85))
+
+    # A very high, very quiet sparkle every few bars.
+    for beat in range(4, 96, 8):
+        events.append(Event(beat, 3.0, 36, LEAD_SOFT, 0.4))
+
+    return Track(
+        "night",
+        root_hz=174.6,
+        bpm=58.0,
+        progression=roots,
+        events=tuple(events),
+        lead=LEAD_VIBRATO,
+        pad=PAD_GLASS,
+        bass=BASS_SOFT,
+        reverb=0.40,
+    )
+
+
+#: Registry of the bundled pieces. Add a Track and it appears in the menu.
+TRACK_LIBRARY: dict[str, Track] = {}
+
+
+def _load_library() -> dict[str, Track]:
+    if not TRACK_LIBRARY:
+        TRACK_LIBRARY.update(
+            hope=track_hope(),
+            lullaby=track_lullaby(),
+            drive=track_drive(),
+            night=track_night(),
+        )
+    return TRACK_LIBRARY
 
 
 # --- Track 1: chiptune -------------------------------------------------------
@@ -344,33 +804,20 @@ def render_chiptune(
     path: str,
     seconds: float = 40.0,
     sample_rate: int = 22050,
+    track: str = "hope",
 ) -> str:
-    """Render the chiptune loop: a wandering lead melody over a soft pad.
+    """Render one of the bundled compositions to a WAV file.
 
-    Chosen over the ambient pad because a moving line is what makes the player
-    aware of the music instead of reading it as background hiss. The melody is
-    fixed rather than random so the loop is recognizable on repeat.
+    ``seconds`` truncates or pads the piece; the natural length of the selected
+    track is used when it is None, so long tracks are not silently cut short.
     """
     rate = _clamp_rate(sample_rate)
-    length = max(4.0, min(float(seconds), MAX_RENDER_SECONDS))
-    bar_seconds = 8 * _CHIPTUNE_BEAT * 2
-    bars = max(1, math.ceil(length / bar_seconds))
+    library = _load_library()
+    piece = library.get(track) or library["hope"]
+    wanted = piece.duration() if seconds is None or seconds <= 0 else float(seconds)
+    wanted = max(2.0, min(wanted, MAX_RENDER_SECONDS))
 
-    mix = array.array("d", bytes(8 * int(length * rate)))
-    for bar in range(bars):
-        root, _ = _PROGRESSION[(bar // 2) % len(_PROGRESSION)]
-        block = _render_chiptune_bar(bar, rate, root)
-        _mix_into(mix, block, 0.85 if bar else 1.0, int(bar * bar_seconds * rate))
-        if int((bar + 1) * bar_seconds * rate) >= len(mix):
-            break
-
-    # Fold the overflow back over the head so the loop point is seamless.
-    total = bars * int(bar_seconds * rate)
-    if total > len(mix):
-        overlap = total - len(mix)
-        for n in range(overlap):
-            mix[n] = mix[n] * 0.5 + mix[len(mix) - overlap + n] * 0.5
-    _soft_limit(mix)
+    mix = normalize(piece.render(rate, wanted))
 
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -380,6 +827,46 @@ def render_chiptune(
         handle.setframerate(rate)
         handle.writeframes(_to_pcm16(mix, MASTER_GAIN))
     return str(target)
+
+
+def normalize(buf: array.array, target_rms: float = 0.11, ceiling: float = 0.95) -> array.array:
+    """Even out loudness across tracks, then keep peaks under the ceiling.
+
+    Peak-only normalization is not enough here: a dense driving piece and a
+    sparse ballad have the same peak but wildly different average loudness, so
+    switching between them would jump. Scaling by RMS and then limiting the
+    result to the ceiling gives every track comparable perceived volume.
+    """
+    total = 0.0
+    peak = 0.0
+    for value in buf:
+        total += value * value
+        magnitude = -value if value < 0.0 else value
+        if magnitude > peak:
+            peak = magnitude
+    count = len(buf)
+    if count == 0 or peak < 1e-9:
+        return buf
+    rms = math.sqrt(total / count)
+    if rms < 1e-9:
+        return buf
+
+    factor = target_rms / rms
+    if peak * factor > ceiling:
+        factor = ceiling / peak
+    if abs(factor - 1.0) < 0.02:
+        return buf
+    for n in range(count):
+        buf[n] *= factor
+    return buf
+
+
+def _track_label(track: str) -> str:
+    library = _load_library()
+    piece = library.get(track)
+    if piece is None:
+        return track
+    return f"{track} ({piece.bpm:.0f} bpm, {piece.duration():.0f}s)"
 
 
 def render_clip(
@@ -428,14 +915,14 @@ def render_clip(
 
 def generate_loop(
     directory: str | None = None,
-    seconds: float = DEFAULT_LOOP_SECONDS,
+    seconds: float = 0.0,
     cache_name: str = CACHE_NAME,
-    track: str = "chiptune",
+    track: str = "hope",
 ) -> str | None:
     """Render (once) and cache the loop; returns the WAV path or None.
 
-    ``track`` picks the style. The cache file name includes the style so
-    switching never reuses a stale render of the wrong music.
+    ``seconds`` of 0 means "use the track's natural length". The cache file name
+    includes the style so switching never reuses a stale render.
     """
     base = Path(directory) if directory else Path(tempfile.gettempdir())
     name = cache_name.replace(".wav", f"_{track}.wav")
@@ -446,16 +933,15 @@ def generate_loop(
     except OSError:
         pass
     try:
-        if track == "ambient":
-            return render_clip(str(target), seconds=seconds)
-        return render_chiptune(str(target), seconds=seconds)
+        return render_chiptune(str(target), seconds=seconds, track=track)
     except Exception as exc:  # render must never break the caller
         _debug(f"render failed: {exc}")
         return None
 
 
-#: Selectable styles offered in the music menu.
-TRACKS: tuple[str, ...] = ("chiptune", "ambient")
+def available_tracks() -> tuple[str, ...]:
+    """Names of the bundled compositions, in menu order."""
+    return tuple(_load_library())
 
 
 # --- Backends ---------------------------------------------------------------
@@ -1014,7 +1500,7 @@ class Music:
 
     _player: MusicPlayer | None = None
     _enabled = False
-    _track = "chiptune"
+    _track = "hope"
 
     @classmethod
     def track(cls) -> str:
@@ -1028,7 +1514,7 @@ class Music:
         Returns True when the requested style is valid. Switching while stopped
         simply records the choice; the next enable() renders it.
         """
-        if track not in TRACKS:
+        if track not in _load_library():
             return False
         was_on = cls._enabled
         if was_on:

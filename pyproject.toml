@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cyberkit"
+version = "0.1.0"
+description = "Modular reconnaissance toolkit for authorized security assessments"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+cyberkit = "cyberkit.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["cyberkit*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "C4", "RUF"]
+ignore = ["E501", "B008", "RUF001", "RUF002", "RUF003", "B904"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+ignore_missing_imports = true
+disallow_untyped_defs = true
+
+[tool.pyright]
+include = ["cyberkit"]
+typeCheckingMode = "standard"
